@@ -9,6 +9,7 @@ use lava_api::job::{self, Jobs, JobsBuilder};
 use lava_api::joblog::{JobLog, JobLogBuilder, JobLogRaw};
 use lava_api::paginator::{PaginationError, Paginator};
 use lava_api::tag::Tag;
+use lava_api::test::TestCase;
 use lava_api::worker::Worker;
 
 #[cfg(debug_assertions)]
@@ -107,6 +108,7 @@ impl ThrottlerDebug {
 #[derive(Debug)]
 pub struct Permit<'a> {
     _permit: SemaphorePermit<'a>,
+    _bulk: Option<SemaphorePermit<'a>>,
     #[cfg(debug_assertions)]
     _debug: PermitDebug<'a>,
 }
@@ -114,6 +116,8 @@ pub struct Permit<'a> {
 #[derive(Debug)]
 pub struct Throttler {
     tickets: Semaphore,
+    /// Limits the requests that keep their permit for long, see [`Throttler::acquire_bulk`]
+    bulk: Semaphore,
     #[cfg(debug_assertions)]
     debug: ThrottlerDebug,
 }
@@ -122,6 +126,7 @@ impl Throttler {
     pub fn new(max_concurrent_requests: usize) -> Self {
         Self {
             tickets: Semaphore::new(max_concurrent_requests),
+            bulk: Semaphore::new((max_concurrent_requests / 2).max(1)),
             #[cfg(debug_assertions)]
             debug: ThrottlerDebug::new(),
         }
@@ -139,9 +144,22 @@ impl Throttler {
 
         Permit {
             _permit: permit,
+            _bulk: None,
             #[cfg(debug_assertions)]
             _debug: debug,
         }
+    }
+
+    /// Get a permit for a request that keeps it for long, like paging through many results
+    ///
+    /// At most half of the permits (but at least one) are given out this way, so that such
+    /// requests can't hold all of them and stall everything else using this throttler.
+    pub async fn acquire_bulk(&self, debug: &str) -> Permit<'_> {
+        // This unwrap is safe: we never close the semaphore
+        let bulk = self.bulk.acquire().await.unwrap();
+        let mut permit = self.acquire(debug).await;
+        permit._bulk = Some(bulk);
+        permit
     }
 
     #[allow(dead_code)]
@@ -164,6 +182,7 @@ impl Throttler {
 
         Some(Permit {
             _permit: permit,
+            _bulk: None,
             #[cfg(debug_assertions)]
             _debug: debug,
         })
@@ -253,6 +272,12 @@ impl ThrottledLava {
     ) -> Result<impl Stream<Item = Result<Bytes, job::ResultsError>> + '_, job::ResultsError> {
         let _permit = self.throttler.acquire("job_results").await;
         job::job_results_as_junit(&self.inner, id).await
+    }
+
+    pub async fn test_cases(&self, job_id: i64) -> Throttled<'_, Paginator<TestCase>> {
+        // A job can have many pages of test cases and the permit is kept for all of them.
+        let permit = self.throttler.acquire_bulk("test_cases").await;
+        Throttled::new(self.inner.test_cases(job_id), permit)
     }
 
     pub async fn workers(&self) -> Throttled<'_, Paginator<Worker>> {
@@ -455,5 +480,27 @@ mod tests {
         drop(p3);
 
         let _p4 = t.acquire("p4").await;
+    }
+
+    #[test]
+    async fn bulk_permits_leave_room_for_other_requests() {
+        let t = Throttler::new(4);
+
+        let _b1 = t.acquire_bulk("b1").await;
+        let b2 = t.acquire_bulk("b2").await;
+
+        let mut b3 = Box::pin(t.acquire_bulk("b3"));
+        assert!(futures::poll!(b3.as_mut()).is_pending());
+
+        // The bulk request that has to wait doesn't take a permit from the others meanwhile.
+        let _p1 = t.acquire("p1").await;
+        let _p2 = t.acquire("p2").await;
+        assert!(t.try_acquire("p3").await.is_none());
+
+        drop(b2);
+        let _b3 = b3.await;
+
+        let single = Throttler::new(1);
+        let _b = single.acquire_bulk("b").await;
     }
 }

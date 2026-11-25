@@ -17,12 +17,13 @@ use handlebars::Handlebars;
 use lava_api::job::Health;
 use lava_api::joblog::{JobLogError, JobLogLevel, JobLogMsg};
 use lava_api::paginator::PaginationError;
+use lava_api::test::{ErrorType, PassFail, TestCase};
 use lava_api::{Lava, job};
 use masker::Masker;
 use rand::random;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 use tracing::{debug, info};
@@ -34,6 +35,145 @@ mod throttled;
 use throttled::{ThrottledLava, Throttler};
 
 const MASK_PATTERN: &str = "[MASKED]";
+/// How many failed test cases to name in a failure summary
+const MAX_LISTED_FAILURES: usize = 10;
+const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often in a row a failed request for test results is repeated
+const MAX_PAGE_RETRIES: u32 = 3;
+/// Wait before repeating a failed request for test results, multiplied by the attempt number
+const PAGE_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Length limits, in characters, for text supplied by LAVA in a failure summary
+const MAX_TEXT_CHARS: usize = 500;
+const MAX_NAME_CHARS: usize = 100;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FailureList {
+    total: usize,
+    names: Vec<String>,
+}
+
+impl FailureList {
+    fn record(&mut self, name: impl FnOnce() -> String) {
+        self.total += 1;
+        if self.names.len() < MAX_LISTED_FAILURES {
+            self.names.push(name());
+        }
+    }
+}
+
+/// What the LAVA test results say about why a job failed
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Diagnostic {
+    /// Error type of the `lava/job` result, which LAVA records for a job that didn't complete
+    error_type: Option<ErrorType>,
+    /// Error message of the `lava/job` result
+    error_msg: Option<String>,
+    /// Failed test cases as `definition/case`, in the order LAVA reports them
+    failed: FailureList,
+    /// Failed results LAVA recorded for its own actions, which mostly repeat the error above
+    failed_actions: FailureList,
+}
+
+/// Put text supplied by LAVA on one line and drop control characters
+///
+/// Error messages can be multi-line (tracebacks, bootloader output) and would otherwise break the
+/// one line per fact layout of the failure summary and its styling.
+fn single_line(text: &str) -> String {
+    text.split_whitespace()
+        .map(|word| word.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Cut text to at most `max_chars` characters, marking the cut
+fn truncate(text: String, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text,
+    }
+}
+
+/// Make text supplied by LAVA fit for the failure summary: masked, on one line, of limited length
+///
+/// Masking is done on both sides of `single_line`: before, for a secret that itself contains
+/// what `single_line` rewrites, and after, as joining lines and dropping control characters can
+/// put a secret together that wasn't in the text as LAVA sent it. The text is cut last, a secret
+/// cut in half would no longer be masked.
+fn lava_text(text: &str, max_chars: usize, mask: &impl Fn(&str) -> String) -> String {
+    truncate(mask(&single_line(&mask(text))), max_chars)
+}
+
+/// Describe a failed LAVA job in a few lines for the end of the GitLab job log
+///
+/// `mask` is applied to everything LAVA supplied. The job id and URL are ours and are printed
+/// as everywhere else in the log.
+fn failure_summary(
+    id: i64,
+    url: &Url,
+    health: Health,
+    failure_comment: Option<&str>,
+    diagnostic: Option<&Diagnostic>,
+    mask: impl Fn(&str) -> String,
+) -> Vec<String> {
+    let text = |text: &str| Some(lava_text(text, MAX_TEXT_CHARS, &mask)).filter(|t| !t.is_empty());
+    let comment = failure_comment.and_then(text);
+    // LAVA has an error type "None", which says as little as a missing one.
+    let error_type = diagnostic
+        .and_then(|d| d.error_type)
+        .filter(|error_type| *error_type != ErrorType::None);
+    let error = diagnostic.and_then(|d| d.error_msg.as_deref().and_then(text));
+    // LAVA's own actions are only worth naming when nothing else explains the failure.
+    let failed = match diagnostic {
+        Some(d) if d.failed.total > 0 => Some(&d.failed),
+        Some(d) if error.is_none() && d.failed_actions.total > 0 => Some(&d.failed_actions),
+        _ => None,
+    };
+
+    let mut lines = Vec::new();
+    match (error_type, error, comment) {
+        (Some(error_type), Some(msg), _) => {
+            lines.push(format!("LAVA job {id} [{error_type}]: {msg}"))
+        }
+        (None, Some(msg), _) => lines.push(format!("LAVA job {id}: {msg}")),
+        // An error type without a message still says more than the health does.
+        (Some(error_type), None, Some(comment)) => {
+            lines.push(format!("LAVA job {id} [{error_type}]: {comment}"))
+        }
+        (Some(error_type), None, None) => lines.push(format!(
+            "LAVA job {id} [{error_type}]: finished with health {health}"
+        )),
+        (None, None, Some(comment)) => lines.push(format!("LAVA job {id} [{health}]: {comment}")),
+        // A complete job is only reported here because its test results weren't all passes;
+        // naming just the health would read as a success.
+        (None, None, None) if failed.is_none() && health == Health::Complete => lines.push(
+            format!("LAVA job {id} completed, but not all of its tests passed"),
+        ),
+        (None, None, None) if failed.is_none() => {
+            lines.push(format!("LAVA job {id} finished with health {health}"))
+        }
+        (None, None, None) => {}
+    }
+    if let Some(failed) = failed {
+        let mut names = failed
+            .names
+            .iter()
+            .map(|name| lava_text(name, MAX_NAME_CHARS, &mask))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let omitted = failed.total - failed.names.len();
+        if omitted > 0 {
+            names.push_str(&format!(" and {omitted} more"));
+        }
+        lines.push(format!(
+            "LAVA job {id}: {} failed test case{}: {names}",
+            failed.total,
+            if failed.total == 1 { "" } else { "s" },
+        ));
+    }
+    lines.push(format!("See {url}"));
+    lines
+}
 
 #[derive(Debug, Clone)]
 struct MonitorTimeout {
@@ -241,6 +381,83 @@ fn color_for_level(lvl: &JobLogLevel) -> Color {
     }
 }
 
+/// Whether repeating a failed request for test results can help
+///
+/// It can't for a reply that doesn't decode or that the server refuses for good, and the
+/// paginator ends after a next page link it can't parse.
+fn is_transient(error: &PaginationError) -> bool {
+    match error {
+        PaginationError::ReqWest(e) => {
+            !e.is_decode() && !e.status().is_some_and(|status| status.is_client_error())
+        }
+        PaginationError::ParseNextError(_) => false,
+        _ => true,
+    }
+}
+
+/// Collect the reason LAVA recorded for a failed job from its test results
+///
+/// Test cases that failed and those with an unknown result are collected: LAVA's JUnit output,
+/// which decides whether a complete job passed, counts the latter as errors.
+///
+/// The results are added to `diagnostic` as they arrive, so that whatever was seen before an
+/// error, or before the caller gave up waiting, is still available.
+///
+/// The paginator repeats the request for a page that failed when it is polled again. That is
+/// done up to `MAX_PAGE_RETRIES` times in a row for errors that can be temporary, waiting
+/// `retry_delay` times the attempt number in between: LAVA records the `lava/job` result last,
+/// so giving up on an earlier page loses the error message.
+///
+/// TODO: this reads every test case of the job, passes included, one request per page, because
+/// lava-api can't filter test cases. For a job with very many results the error message may not
+/// be reached within the caller's timeout. Query the `lava/job` result and the failed cases
+/// directly once lava-api allows it. lava-api also decodes a page as a whole, so one result it
+/// can't decode (an error type it doesn't know, say) ends the collection.
+async fn collect_diagnostic<S>(
+    mut cases: S,
+    diagnostic: &mut Diagnostic,
+    retry_delay: Duration,
+) -> Result<(), PaginationError>
+where
+    S: Stream<Item = Result<TestCase, PaginationError>> + Unpin,
+{
+    let mut retries = 0;
+    loop {
+        let case = match cases.next().await {
+            None => return Ok(()),
+            Some(Ok(case)) => {
+                retries = 0;
+                case
+            }
+            Some(Err(e)) if retries < MAX_PAGE_RETRIES && is_transient(&e) => {
+                retries += 1;
+                debug!("retry {} of getting test results: {:?}", retries, e);
+                sleep(retry_delay * retries).await;
+                continue;
+            }
+            Some(Err(e)) => return Err(e),
+        };
+        let note = match case.result {
+            PassFail::Fail => "",
+            PassFail::Unknown => " (unknown result)",
+            PassFail::Pass | PassFail::Skip => continue,
+        };
+        match case.metadata {
+            Some(metadata) if metadata.definition == "lava" && case.name == "job" => {
+                diagnostic.error_type = metadata.error_type;
+                diagnostic.error_msg = metadata.error_msg;
+            }
+            Some(metadata) if metadata.definition == "lava" => diagnostic
+                .failed_actions
+                .record(|| format!("lava/{}{note}", case.name)),
+            Some(metadata) => diagnostic
+                .failed
+                .record(|| format!("{}/{}{note}", metadata.definition, case.name)),
+            None => diagnostic.failed.record(|| format!("{}{note}", case.name)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum JobCancelBehaviour {
     CancelLava,
@@ -405,8 +622,12 @@ impl Run {
         for d in self.job.dependencies() {
             let artifact = match d.download().await {
                 Ok(a) => a,
-                Err(_) => {
-                    outputln!("Failed to get artifact from {}", d.name());
+                Err(e) => {
+                    outputln!(
+                        "Failed to get artifact from {}: {}",
+                        d.name(),
+                        self.mask_variables(&e.to_string())
+                    );
                     continue;
                 }
             };
@@ -570,6 +791,62 @@ impl Run {
         }
     }
 
+    /// Print where to find a LAVA job that failed
+    fn print_job_link(&self, id: i64) {
+        let line = format!("See {}", self.url_for_id(id));
+        outputln!("{}", line.bright_red().bold());
+    }
+
+    /// Print why a LAVA job failed and where to find it
+    ///
+    /// This is only for the reader of the log. A failure to look up the details is reported and
+    /// otherwise ignored. The lookup is skipped for a cancelled job and given up when the GitLab
+    /// job is cancelled, so that cancelling doesn't have to wait for it.
+    async fn report_failure(
+        &self,
+        id: i64,
+        health: Health,
+        failure_comment: Option<&str>,
+        cancel_token: &CancellationToken,
+    ) {
+        let mut diagnostic = Diagnostic::default();
+        if health != Health::Canceled {
+            let lookup = async {
+                // Get the request permit first: time spent queueing behind other requests of
+                // this runner says nothing about LAVA and must not use up the time allowed for
+                // the lookup.
+                let cases = self.lava.test_cases(id).await;
+                timeout(
+                    DIAGNOSTIC_TIMEOUT,
+                    collect_diagnostic(cases, &mut diagnostic, PAGE_RETRY_DELAY),
+                )
+                .await
+            };
+            match cancel_token.run_until_cancelled(lookup).await {
+                None | Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => {
+                    outputln!(
+                        "Failed to get all test results of LAVA job {}, the summary may be incomplete: {}",
+                        id,
+                        self.mask_variables(&e.to_string())
+                    );
+                }
+                Some(Err(_)) => {
+                    outputln!(
+                        "Timed out getting test results of LAVA job {}, the summary may be incomplete",
+                        id
+                    );
+                }
+            }
+        }
+
+        let url = self.url_for_id(id);
+        let mask = |text: &str| self.mask_variables(text);
+        for line in failure_summary(id, &url, health, failure_comment, Some(&diagnostic), mask) {
+            outputln!("{}", line.bright_red().bold());
+        }
+    }
+
     async fn wait_for_jobs(
         &self,
         mut ids: HashSet<i64>,
@@ -590,37 +867,68 @@ impl Run {
             }
 
             let mut jobs = builder.query();
+            let mut failed = Vec::new();
+            let mut to_cancel = Vec::new();
             while let Some(job) = jobs.next().await {
-                if let Ok(job) = job {
-                    if job.state == job::State::Running && !running.contains(&job.id) {
-                        outputln!("{} is running", self.url_for_id(job.id));
-                        running.insert(job.id);
+                let job = match job {
+                    Ok(job) => job,
+                    Err(e) => {
+                        // The paginator repeats a failed request when polled again and so never
+                        // ends while LAVA is unreachable. Leave that to the next poll, after
+                        // the usual wait.
+                        outputln!(
+                            "Failed to check status: {}",
+                            self.mask_variables(&e.to_string())
+                        );
+                        break;
                     }
-                    if job.state == job::State::Finished {
-                        ids.remove(&job.id);
-                        if job.health == Health::Complete {
-                            outputln!("{} successfully finished", self.url_for_id(job.id));
-                        } else {
-                            outputln!("{} UNSUCCESSFULL!", self.url_for_id(job.id));
-                            failures = true;
-                        }
+                };
+                if job.state == job::State::Running && !running.contains(&job.id) {
+                    outputln!("{} is running", self.url_for_id(job.id));
+                    running.insert(job.id);
+                }
+                if job.state == job::State::Finished {
+                    ids.remove(&job.id);
+                    if job.health == Health::Complete {
+                        outputln!("{} successfully finished", self.url_for_id(job.id));
+                    } else {
+                        outputln!("{} UNSUCCESSFULL!", self.url_for_id(job.id));
+                        failures = true;
+                        failed.push((job.id, job.health, job.failure_comment.clone()));
                     }
-                    if cancel_token.is_cancelled() {
-                        match job.state {
-                            job::State::Finished | job::State::Canceling => {}
-                            _ => match self.cancel_job(cancel_behaviour, job.id).await {
-                                Ok(_) => {
-                                    outputln!("Cancelled LAVA job {}", job.id);
-                                    ids.remove(&job.id);
-                                }
-                                Err(e) => {
-                                    outputln!("Error cancelling LAVA job {}: {}", job.id, e);
-                                }
-                            },
-                        }
+                }
+                if cancel_token.is_cancelled() {
+                    match job.state {
+                        job::State::Finished | job::State::Canceling => {}
+                        _ => to_cancel.push(job.id),
                     }
                 }
             }
+
+            // The job query holds a request permit, release it before making further requests:
+            // holding two permits at once can deadlock.
+            drop(jobs);
+
+            // Cancelling goes first, it shouldn't have to wait for the failure reports.
+            for id in to_cancel {
+                match self.cancel_job(cancel_behaviour, id).await {
+                    Ok(_) => {
+                        outputln!("Cancelled LAVA job {}", id);
+                        ids.remove(&id);
+                    }
+                    Err(e) => {
+                        outputln!("Error cancelling LAVA job {}: {}", id, e);
+                    }
+                }
+            }
+
+            // Look the failures up concurrently so that many jobs failing at once don't hold up
+            // the next poll for long; the throttler limits how many lookups run at a time. Each
+            // report prints its lines in one go, so they don't mix.
+            futures::future::join_all(failed.iter().map(|(id, health, comment)| {
+                self.report_failure(*id, *health, comment.as_deref(), cancel_token)
+            }))
+            .await;
 
             sleep(timeout.next_timeout()).await;
         }
@@ -634,18 +942,29 @@ impl Run {
             self.lava
                 .job_results_as_junit(id)
                 .await
-                .map_err(|_| ())?
+                .map_err(|e| {
+                    outputln!(
+                        "Failed to get job results: {}",
+                        self.mask_variables(&e.to_string())
+                    );
+                })?
                 .map_err(std::io::Error::other),
         )
         .into_async_read()
         .read_to_end(&mut bytes)
         .await
         .map_err(|e| {
-            outputln!("Failed to get job results: {}", e);
+            outputln!(
+                "Failed to get job results: {}",
+                self.mask_variables(&e.to_string())
+            );
         })?;
 
         let ts = junit_parser::from_reader(bytes.reader()).map_err(|e| {
-            outputln!("Failed to parse job results: {}", e);
+            outputln!(
+                "Failed to parse job results: {}",
+                self.mask_variables(&e.to_string())
+            );
         })?;
 
         Ok(ts.errors == 0 && ts.failures == 0)
@@ -685,12 +1004,30 @@ impl Run {
                                     }
                                     Ok(false) => {
                                         outputln!("Job completed with errors");
+                                        self.report_failure(
+                                            id,
+                                            job.health,
+                                            job.failure_comment.as_deref(),
+                                            cancel_token,
+                                        )
+                                        .await;
                                         return Err(());
                                     }
-                                    Err(_) => return Err(()),
+                                    Err(_) => {
+                                        // Why is already printed, and it isn't a test failure.
+                                        self.print_job_link(id);
+                                        return Err(());
+                                    }
                                 };
                             } else {
                                 outputln!("Job didn't complete correctly");
+                                self.report_failure(
+                                    id,
+                                    job.health,
+                                    job.failure_comment.as_deref(),
+                                    cancel_token,
+                                )
+                                .await;
                                 return Err(());
                             }
                         }
@@ -988,4 +1325,475 @@ async fn main() {
         .run(new_job, 64)
         .await
         .expect("Couldn't pick up jobs");
+}
+
+#[cfg(test)]
+mod failure_summary_tests {
+    use super::*;
+
+    fn url() -> Url {
+        "https://lava.example.com/scheduler/job/42".parse().unwrap()
+    }
+
+    fn see() -> String {
+        "See https://lava.example.com/scheduler/job/42".to_string()
+    }
+
+    fn summary(
+        id: i64,
+        url: &Url,
+        health: Health,
+        failure_comment: Option<&str>,
+        diagnostic: Option<&Diagnostic>,
+    ) -> Vec<String> {
+        failure_summary(id, url, health, failure_comment, diagnostic, str::to_owned)
+    }
+
+    fn failures(names: &[&str]) -> FailureList {
+        let mut list = FailureList::default();
+        for name in names {
+            list.record(|| (*name).to_owned());
+        }
+        list
+    }
+
+    #[test]
+    fn job_error_wins_over_comment() {
+        let diagnostic = Diagnostic {
+            error_type: Some(ErrorType::Infrastructure),
+            error_msg: Some("matched a bootloader error message: 'File not found' (7)".to_string()),
+            failed_actions: failures(&["lava/uboot-action"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(
+                42,
+                &url(),
+                Health::Incomplete,
+                Some("edited later"),
+                Some(&diagnostic)
+            ),
+            [
+                "LAVA job 42 [Infrastructure]: matched a bootloader error message: \
+                 'File not found' (7)"
+                    .to_string(),
+                see()
+            ]
+        );
+    }
+
+    #[test]
+    fn comment_is_used_without_job_error() {
+        assert_eq!(
+            summary(
+                42,
+                &url(),
+                Health::Incomplete,
+                Some(" board fell over \n"),
+                Some(&Diagnostic::default())
+            ),
+            [
+                "LAVA job 42 [Incomplete]: board fell over".to_string(),
+                see()
+            ]
+        );
+    }
+
+    #[test]
+    fn blank_job_errors_allow_comment_and_action_fallbacks() {
+        for msg in ["", " \t\n"] {
+            let diagnostic = Diagnostic {
+                error_type: Some(ErrorType::Infrastructure),
+                error_msg: Some(msg.to_owned()),
+                failed_actions: failures(&["lava/boot"]),
+                ..Default::default()
+            };
+            assert_eq!(
+                summary(
+                    42,
+                    &url(),
+                    Health::Incomplete,
+                    Some("boot failed"),
+                    Some(&diagnostic)
+                ),
+                [
+                    "LAVA job 42 [Infrastructure]: boot failed".to_string(),
+                    "LAVA job 42: 1 failed test case: lava/boot".to_string(),
+                    see()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn error_type_without_message_is_kept() {
+        let diagnostic = Diagnostic {
+            error_type: Some(ErrorType::Infrastructure),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(42, &url(), Health::Incomplete, None, Some(&diagnostic)),
+            [
+                "LAVA job 42 [Infrastructure]: finished with health Incomplete".to_string(),
+                see()
+            ]
+        );
+    }
+
+    #[test]
+    fn error_type_none_is_not_shown() {
+        let mut diagnostic = Diagnostic {
+            error_type: Some(ErrorType::None),
+            error_msg: Some("something broke".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(42, &url(), Health::Incomplete, None, Some(&diagnostic)),
+            ["LAVA job 42: something broke".to_string(), see()]
+        );
+
+        diagnostic.error_msg = None;
+        assert_eq!(
+            summary(
+                42,
+                &url(),
+                Health::Incomplete,
+                Some("oops"),
+                Some(&diagnostic)
+            ),
+            ["LAVA job 42 [Incomplete]: oops".to_string(), see()]
+        );
+    }
+
+    #[test]
+    fn secrets_are_masked_however_lava_formats_them() {
+        let mask = |text: &str| text.replace("abc def", MASK_PATTERN);
+        for msg in [
+            "abc def",
+            "abc\ndef",
+            "abc  def",
+            "abc \x1b def",
+            "a\x07bc def",
+        ] {
+            let diagnostic = Diagnostic {
+                error_msg: Some(format!("token {msg} rejected")),
+                failed: failures(&[&format!("0_t/{msg}")]),
+                ..Default::default()
+            };
+            assert_eq!(
+                failure_summary(
+                    42,
+                    &url(),
+                    Health::Incomplete,
+                    Some(msg),
+                    Some(&diagnostic),
+                    mask
+                ),
+                [
+                    "LAVA job 42: token [MASKED] rejected".to_string(),
+                    "LAVA job 42: 1 failed test case: 0_t/[MASKED]".to_string(),
+                    see()
+                ],
+                "{msg:?}"
+            );
+            assert_eq!(
+                failure_summary(42, &url(), Health::Incomplete, Some(msg), None, mask),
+                ["LAVA job 42 [Incomplete]: [MASKED]".to_string(), see()],
+                "{msg:?}"
+            );
+        }
+
+        // A secret that spans lines itself is found before the lines are joined.
+        let mask = |text: &str| text.replace("abc\ndef", MASK_PATTERN);
+        assert_eq!(
+            failure_summary(42, &url(), Health::Incomplete, Some("abc\ndef"), None, mask),
+            ["LAVA job 42 [Incomplete]: [MASKED]".to_string(), see()]
+        );
+    }
+
+    #[test]
+    fn long_text_is_cut() {
+        let diagnostic = Diagnostic {
+            error_msg: Some("é".repeat(MAX_TEXT_CHARS + 1)),
+            failed: failures(&[&"n".repeat(MAX_NAME_CHARS + 1), "short"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(42, &url(), Health::Incomplete, None, Some(&diagnostic)),
+            [
+                format!("LAVA job 42: {}…", "é".repeat(MAX_TEXT_CHARS)),
+                format!(
+                    "LAVA job 42: 2 failed test cases: {}…, short",
+                    "n".repeat(MAX_NAME_CHARS)
+                ),
+                see()
+            ]
+        );
+
+        let exact = "x".repeat(MAX_TEXT_CHARS);
+        assert_eq!(
+            summary(42, &url(), Health::Incomplete, Some(&exact), None)[0],
+            format!("LAVA job 42 [Incomplete]: {exact}")
+        );
+    }
+
+    #[test]
+    fn health_is_the_fallback() {
+        for diagnostic in [None, Some(&Diagnostic::default())] {
+            assert_eq!(
+                summary(42, &url(), Health::Canceled, Some("  "), diagnostic),
+                [
+                    "LAVA job 42 finished with health Canceled".to_string(),
+                    see()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn failed_tests_of_a_complete_job() {
+        let diagnostic = Diagnostic {
+            failed: failures(&["0_dmesg/emerg"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(42, &url(), Health::Complete, None, Some(&diagnostic)),
+            [
+                "LAVA job 42: 1 failed test case: 0_dmesg/emerg".to_string(),
+                see()
+            ]
+        );
+    }
+
+    #[test]
+    fn job_error_and_failed_tests() {
+        let diagnostic = Diagnostic {
+            error_type: Some(ErrorType::Test),
+            error_msg: Some("lava-test-shell timed out".to_string()),
+            failed: failures(&["1_kselftest/a", "1_kselftest/b"]),
+            failed_actions: failures(&["lava/lava-test-shell"]),
+        };
+        assert_eq!(
+            summary(42, &url(), Health::Incomplete, None, Some(&diagnostic)),
+            [
+                "LAVA job 42 [Test]: lava-test-shell timed out".to_string(),
+                "LAVA job 42: 2 failed test cases: 1_kselftest/a, 1_kselftest/b".to_string(),
+                see()
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_actions_are_the_last_resort() {
+        let mut diagnostic = Diagnostic {
+            failed_actions: failures(&["lava/0_dmesg"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(42, &url(), Health::Complete, None, Some(&diagnostic)),
+            [
+                "LAVA job 42: 1 failed test case: lava/0_dmesg".to_string(),
+                see()
+            ]
+        );
+
+        diagnostic.failed = failures(&["0_dmesg/warn"]);
+        assert_eq!(
+            summary(42, &url(), Health::Complete, None, Some(&diagnostic)),
+            [
+                "LAVA job 42: 1 failed test case: 0_dmesg/warn".to_string(),
+                see()
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_job_without_details_does_not_read_as_success() {
+        for diagnostic in [None, Some(&Diagnostic::default())] {
+            assert_eq!(
+                summary(42, &url(), Health::Complete, None, diagnostic),
+                [
+                    "LAVA job 42 completed, but not all of its tests passed".to_string(),
+                    see()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn lava_text_is_put_on_one_line() {
+        let diagnostic = Diagnostic {
+            error_type: Some(ErrorType::Bug),
+            error_msg: Some("Traceback:\r\n  File \"x.py\"\n\x1b[31mKeyError\x07\n".to_string()),
+            failed: failures(&["0_a/b\nc"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(42, &url(), Health::Incomplete, None, Some(&diagnostic)),
+            [
+                "LAVA job 42 [Bug]: Traceback: File \"x.py\" [31mKeyError".to_string(),
+                "LAVA job 42: 1 failed test case: 0_a/b c".to_string(),
+                see()
+            ]
+        );
+        assert_eq!(
+            summary(
+                42,
+                &url(),
+                Health::Incomplete,
+                Some("line one\nline two"),
+                None
+            ),
+            [
+                "LAVA job 42 [Incomplete]: line one line two".to_string(),
+                see()
+            ]
+        );
+    }
+
+    fn case(definition: &str, name: &str, error_msg: Option<&str>) -> TestCase {
+        TestCase {
+            id: 1,
+            name: name.to_string(),
+            unit: String::new(),
+            result: PassFail::Fail,
+            measurement: None,
+            metadata: Some(lava_api::test::Metadata {
+                definition: definition.to_string(),
+                case: name.to_string(),
+                result: PassFail::Fail,
+                namespace: None,
+                level: None,
+                duration: None,
+                extra: None,
+                error_msg: error_msg.map(str::to_string),
+                error_type: error_msg.map(|_| ErrorType::Infrastructure),
+            }),
+            suite: 1,
+            start_log_line: None,
+            end_log_line: None,
+            test_set: None,
+            logged: chrono::Utc::now(),
+            resource_uri: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn results_before_an_error_are_kept() {
+        let cases = futures::stream::iter([
+            Ok(case("lava", "job", Some("boot failed"))),
+            Ok(case("0_dmesg", "emerg", None)),
+            Err(PaginationError::ParseNextError(url::ParseError::EmptyHost)),
+            Ok(case("0_dmesg", "alert", None)),
+        ]);
+        let mut diagnostic = Diagnostic::default();
+        assert!(
+            collect_diagnostic(cases, &mut diagnostic, Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            diagnostic,
+            Diagnostic {
+                error_type: Some(ErrorType::Infrastructure),
+                error_msg: Some("boot failed".to_string()),
+                failed: failures(&["0_dmesg/emerg"]),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn results_before_a_timeout_are_kept() {
+        let cases = futures::stream::iter([Ok(case("0_dmesg", "emerg", None))])
+            .chain(futures::stream::pending());
+        let mut diagnostic = Diagnostic::default();
+        let collect = collect_diagnostic(cases, &mut diagnostic, Duration::ZERO);
+        assert!(timeout(Duration::from_millis(10), collect).await.is_err());
+        assert_eq!(diagnostic.failed, failures(&["0_dmesg/emerg"]));
+    }
+
+    #[tokio::test]
+    async fn temporary_errors_are_retried() {
+        let error = || Err(PaginationError::RedirectMissing);
+        let cases = futures::stream::iter([
+            Ok(case("0_dmesg", "emerg", None)),
+            error(),
+            error(),
+            error(),
+            Ok(case("0_dmesg", "alert", None)),
+            error(),
+            Ok(case("lava", "job", Some("boot failed"))),
+        ]);
+        let mut diagnostic = Diagnostic::default();
+        assert!(
+            collect_diagnostic(cases, &mut diagnostic, Duration::ZERO)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            diagnostic,
+            Diagnostic {
+                error_type: Some(ErrorType::Infrastructure),
+                error_msg: Some("boot failed".to_string()),
+                failed: failures(&["0_dmesg/emerg", "0_dmesg/alert"]),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_are_limited() {
+        let cases = futures::stream::iter(
+            std::iter::repeat_with(|| Err(PaginationError::RedirectMissing))
+                .take(MAX_PAGE_RETRIES as usize + 1),
+        )
+        .chain(futures::stream::iter([Ok(case("0_dmesg", "emerg", None))]));
+        let mut diagnostic = Diagnostic::default();
+        assert!(
+            collect_diagnostic(cases, &mut diagnostic, Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert_eq!(diagnostic, Diagnostic::default());
+    }
+
+    #[tokio::test]
+    async fn unknown_results_are_collected() {
+        let mut unknown = case("0_dmesg", "crit", None);
+        unknown.result = PassFail::Unknown;
+        let mut passed = case("0_dmesg", "alert", None);
+        passed.result = PassFail::Pass;
+        let mut skipped = case("0_dmesg", "warn", None);
+        skipped.result = PassFail::Skip;
+        let cases = futures::stream::iter([Ok(unknown), Ok(passed), Ok(skipped)]);
+        let mut diagnostic = Diagnostic::default();
+        assert!(
+            collect_diagnostic(cases, &mut diagnostic, Duration::ZERO)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            summary(42, &url(), Health::Complete, None, Some(&diagnostic)),
+            [
+                "LAVA job 42: 1 failed test case: 0_dmesg/crit (unknown result)".to_string(),
+                see()
+            ]
+        );
+    }
+
+    #[test]
+    fn long_lists_are_cut() {
+        let mut diagnostic = Diagnostic::default();
+        for i in 0..MAX_LISTED_FAILURES + 3 {
+            diagnostic.failed.record(|| format!("t/{i}"));
+        }
+        assert_eq!(diagnostic.failed.names.len(), MAX_LISTED_FAILURES);
+        let summary = summary(42, &url(), Health::Complete, None, Some(&diagnostic));
+        assert_eq!(
+            summary[0],
+            "LAVA job 42: 13 failed test cases: t/0, t/1, t/2, t/3, t/4, t/5, t/6, t/7, t/8, t/9 \
+             and 3 more"
+        );
+    }
 }

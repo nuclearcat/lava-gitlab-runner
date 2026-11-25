@@ -102,6 +102,28 @@ outputs will not be directly logged to the gitlab job log output, only the job
 states are logged. The job will fail if one of the lava jobs finishes with an
 incomplete state.
 
+## Failure summary
+
+When a LAVA job fails, the runner ends its output for that job with the reason
+LAVA recorded and a link to the job, for example:
+
+```
+LAVA job 1234 [Infrastructure]: matched a bootloader error message: 'File not found' (7)
+See https://lava.example.com/scheduler/job/1234
+```
+
+The text in brackets is the LAVA error type. Failed test cases, and those with
+an unknown result, are listed by name. If LAVA recorded no error, the job's
+failure comment or its health is shown instead. Long texts are cut. Masked
+variables are masked in the summary like in the rest of the log.
+
+The runner spends at most 60 seconds reading the test results of a failed job.
+For a job with a very large number of test results that may not be enough to
+read them all; the summary then says it may be incomplete and can lack the
+LAVA error or some of the failed test cases. The test results are not read for
+a job that was cancelled, or once the GitLab job is cancelled. The link to the
+job is always shown.
+
 ## Runner artifacts
 
 When the gitlab job definition defines artifacts, the log file(s) of the
